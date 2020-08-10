@@ -1,16 +1,18 @@
-#include <fstream>
 #include <uWS/uWS.h>
-#include <chrono>
+#include <fstream>
 #include <iostream>
-#include <thread>
+#include <string>
+#include <vector>
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
-#include "spline.h"
-#include "coords_transform.h"
+#include "helpers.h"
+#include "json.hpp"
 
 
-using namespace std;
-using json = nlohmann::json;
+// for convenience
+using nlohmann::json;
+using std::string;
+using std::vector;
 
 
 // Checks if the SocketIO event has JSON data.
@@ -68,12 +70,6 @@ int main() {
 		map_waypoints_dy.push_back(d_y);
 	}
 
-	// Start on lane 1 
-	int lane = 1;
-
-	// Reference velocity (mph)
-	double ref_vel = 0.0;
-
 	h.onMessage([&map_waypoints_x, &map_waypoints_y, &map_waypoints_s, &map_waypoints_dx, &map_waypoints_dy, &ref_vel, &lane](uWS::WebSocket<uWS::SERVER> ws, char* data, size_t length,
 		uWS::OpCode opCode) {
 			// "42" at the start of the message means there's a websocket message event.
@@ -112,165 +108,14 @@ int main() {
 						// Sensor Fusion data - a list of all other cars on the same side of the road.
 						auto sensor_fusion = j[1]["sensor_fusion"];
 
-						int prev_size = previous_path_x.size();
-
-						if (prev_size > 0)
-							car_s = end_path_s;
-
-						bool is_too_close = false;
-						bool prepare_for_lane_change = false;
-						bool ready_for_lane_change = false;
-						bool is_left_lane_free = true;
-						bool is_right_lane_free = true;
-
-						for (size_t i = 0; i < sensor_fusion.size(); ++i) {
-
-							Vehicle vehicle(sensor_fusion[i]);
-
-							if (is_in_lane(vehicle.d, lane)) {
-
-								vehicle.s += (double)prev_size * 0.02 * vehicle.speed; // use previous points to project s value onward
-
-								bool is_in_front_of_us = vehicle.s > car_s;
-								bool is_closer_than_safety_margin = vehicle.s - car_s < safety_margin;
-
-								if (is_in_front_of_us && is_closer_than_safety_margin) {
-									is_too_close = true;
-									prepare_for_lane_change = true;
-								}
-							}
-						}
-
-						if (prepare_for_lane_change) {
-							int num_vehicles_left = 0;
-							int num_vehicles_right = 0;
-							// Check if left and right lanes are free 
-							for (size_t i = 0; i < sensor_fusion.size(); ++i) {
-								Vehicle vehicle(sensor_fusion[i]);
-								// Check left lane
-								if (is_in_lane(vehicle.d, lane - 1)) {
-									++num_vehicles_left;
-									vehicle.s += (double)prev_size * 0.02 * vehicle.speed;
-									bool too_close_to_change = (vehicle.s > car_s - safety_margin / 2) && (vehicle.s < car_s + safety_margin / 2);
-									if (too_close_to_change)
-										is_left_lane_free = false;
-								}
-								// Check right lane 
-								else if (is_in_lane(vehicle.d, lane + 1)) {
-									++num_vehicles_right;
-									vehicle.s += (double)prev_size * 0.02 * vehicle.speed;
-									bool too_close_to_change = (vehicle.s > car_s - safety_margin / 2) && (vehicle.s < car_s + safety_margin / 2);
-									if (too_close_to_change)
-										is_right_lane_free = false;
-								}
-
-								if (is_left_lane_free || is_right_lane_free)
-									ready_for_lane_change = true;
-							}
-							cout << "LEFT " << num_vehicles_left << "RIGHT " << num_vehicles_right << endl;
-						}
-
-						// Actually perform lane change
-						if (ready_for_lane_change && is_left_lane_free && lane > 0)
-							lane -= 1;
-						else if (ready_for_lane_change && is_right_lane_free && lane < 2)
-							lane += 1;
-
-						// Eventually slow down if too close the car before
-						if (is_too_close)
-							ref_vel -= 0.224;					// deceleration around 5 m/s^2
-						else if (ref_vel < max_safe_speed)
-							ref_vel += 0.224;
-
-						// List of widely spaced (x, y) waypoints. These will be later interpolated
-						// with a spline, filling it with more points which control speed.
-						vector<double> pts_x;
-						vector<double> pts_y;
-
-						// Reference x, y, yaw state 
-						double ref_x = car_x;
-						double ref_y = car_y;
-						double ref_yaw = deg2rad(car_yaw);
-
-						// If previous size is almost empty, use the car as a starting reference
-						if (prev_size < 2) {
-							double prev_car_x = car_x - cos(car_yaw);
-							double prev_car_y = car_y - sin(car_yaw);
-
-							pts_x.push_back(prev_car_x); pts_x.push_back(car_x);
-							pts_y.push_back(prev_car_y); pts_y.push_back(car_y);
-						}
-						// Use the previous path's end points as starting reference
-						else {
-							ref_x = previous_path_x[prev_size - 1];
-							ref_y = previous_path_y[prev_size - 1];
-
-							double ref_x_prev = previous_path_x[prev_size - 2];
-							double ref_y_prev = previous_path_y[prev_size - 2];
-							ref_yaw = atan2(ref_y - ref_y_prev, ref_x - ref_x_prev);
-
-							pts_x.push_back(ref_x_prev); pts_x.push_back(ref_x);
-							pts_y.push_back(ref_y_prev); pts_y.push_back(ref_y);
-						}
-
-						// In Frenet coordinates, add evenly 30m spaced points ahead of the starting reference
-						vector<double> next_wp0 = frenet_to_cartesian(car_s + 30, (lane_width * lane + lane_width / 2), map_waypoints_s, map_waypoints_x, map_waypoints_y);
-						vector<double> next_wp1 = frenet_to_cartesian(car_s + 60, (lane_width * lane + lane_width / 2), map_waypoints_s, map_waypoints_x, map_waypoints_y);
-						vector<double> next_wp2 = frenet_to_cartesian(car_s + 90, (lane_width * lane + lane_width / 2), map_waypoints_s, map_waypoints_x, map_waypoints_y);
-
-						pts_x.push_back(next_wp0[0]); pts_x.push_back(next_wp1[0]); pts_x.push_back(next_wp2[0]);
-						pts_y.push_back(next_wp0[1]); pts_y.push_back(next_wp1[1]); pts_y.push_back(next_wp2[1]);
-
-						// Rototranslate into car's reference system to make the math easier
-						for (size_t i = 0; i < pts_x.size(); ++i) {
-							double shift_x = pts_x[i] - ref_x;
-							double shift_y = pts_y[i] - ref_y;
-							pts_x[i] = shift_x * cos(0 - ref_yaw) - shift_y * sin(0 - ref_yaw);
-							pts_y[i] = shift_x * sin(0 - ref_yaw) + shift_y * cos(0 - ref_yaw);
-						}
-
-						// Create a spline
-						tk::spline s;
-						s.set_points(pts_x, pts_y);
+						/**
+						 * TODO: define a path made up of (x,y) points that the car will visit
+						 *   sequentially every .02 seconds
+						 */
 
 						// Define he actual (x, y) points will be used for the planner
 						vector<double> next_x_vals;
 						vector<double> next_y_vals;
-
-						// Start with all previous points from last time
-						for (size_t i = 0; i < previous_path_x.size(); ++i) {
-							next_x_vals.push_back(previous_path_x[i]);
-							next_y_vals.push_back(previous_path_y[i]);
-						}
-
-						// Calculate how to break up spline points to travel at reference velocity
-						double target_x = 30.0;
-						double target_y = s(target_y);
-						double target_dist = sqrt(target_x * target_x + target_y * target_y);
-
-						double x_add_on = 0.0;
-
-						for (size_t i = 1; i <= 50 - previous_path_x.size(); ++i) {
-
-							double N = target_dist / (0.02 * ref_vel / 2.24);
-							double x_point = x_add_on + target_x / N;
-							double y_point = s(x_point);
-
-							x_add_on = x_point;
-
-							double x_ref = x_point;
-							double y_ref = y_point;
-
-							// Rotate back into previous coordinate system
-							x_point = x_ref * cos(ref_yaw) - y_ref * sin(ref_yaw);
-							y_point = x_ref * sin(ref_yaw) + y_ref * cos(ref_yaw);
-
-							x_point += ref_x;
-							y_point += ref_y;
-
-							next_x_vals.push_back(x_point);
-							next_y_vals.push_back(y_point);
-						}
 
 						// Prepare message and send it to the simulator
 						json msgJson;
